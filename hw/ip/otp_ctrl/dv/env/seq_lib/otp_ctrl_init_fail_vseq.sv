@@ -1,0 +1,180 @@
+// Copyright lowRISC contributors.
+// Licensed under the Apache License, Version 2.0, see LICENSE for details.
+// SPDX-License-Identifier: Apache-2.0
+
+// Otp_ctrl_init_fail_vseq is developed to check if otp_ctrl reacts correctly if initialization
+// failed.
+// Note that scoreboard is disabled in this test and all checks are done within this sequence.
+// This test writes and reads to OTP_memory via DAI interface, then triggers digest calculations.
+// Afterwards instead of issuing reset, this sequence continues to write to DAI interface.
+// If any of the hardware partition is updated, then in next power cycle, the initialization will
+// fail.
+// If no check failure, we will random inject ECC errors to create init macro errors.
+// We will also trigger sw partition ECC reg failure by forcing the ECC reg error output.
+//
+// This sequence will check the following items if OTP init failed with fatal error:
+// - Otp_initialization failure triggers fatal alert
+// - Status register reflect the correct error
+// - Otp_ctrl's power init output stays 0
+// This sequence will check the following items if OTP init failed with correctable error:
+// - Otp_initialtion passed with power init output changes to 1
+// - Otp status and interrupt reflect the correct error message
+
+class otp_ctrl_init_fail_vseq extends otp_ctrl_smoke_vseq;
+  `uvm_object_utils(otp_ctrl_init_fail_vseq)
+
+  `uvm_object_new
+
+  rand uint         num_to_lock_digests;
+  bit [NumPart-1:0] init_chk_err;
+
+  // If num_to_lock_digests is larger than num_dai_op, that means there won't be OTP init check
+  // error, so this sequence will trigger ECC error instead.
+  constraint lock_digest_c {num_to_lock_digests < num_dai_op * 2;}
+  constraint num_iterations_c {num_dai_op inside {[20:100]};}
+  constraint ecc_err_c {
+    $countones(ecc_err_mask) dist  {1 :/ 1,  // ECC correctable error
+                                    2 :/ 1}; // ECC uncorrectable error
+  }
+
+  virtual task pre_start();
+    super.pre_start();
+    num_to_lock_digests.rand_mode(0);
+  endtask
+
+  task body();
+    bit [TL_DW-1:0] exp_status;
+    `uvm_info(`gfn, $sformatf("Number of dai operation is %0d, number to lock digest is %0d",
+              num_dai_op, num_to_lock_digests), UVM_MEDIUM)
+
+    for (uint i = 0; i <= num_dai_op; i++) begin
+      bit [TL_DW-1:0] tlul_val;
+
+      `DV_CHECK_RANDOMIZE_FATAL(this)
+      `uvm_info(`gfn, $sformatf("starting dai access seq %0d/%0d with addr %0h in partition %0d",
+                i, num_dai_op, dai_addr, part_idx), UVM_MEDIUM)
+
+      // OTP write via DAI
+      dai_wr(dai_addr, wdata0, wdata1);
+      used_dai_addr_q.push_back(dai_addr);
+
+      if (i > num_to_lock_digests && part_idx inside {[HwCfgIdx: Secret2Idx]}) begin
+        init_chk_err[part_idx] = 1;
+      end
+
+      // OTP read via DAI, check data in scb
+      dai_rd(dai_addr, 0, wdata0, wdata1);
+
+      // If write sw partitions, check tlul window
+      if (is_sw_part(dai_addr)) begin
+        uvm_reg_addr_t tlul_addr = cfg.ral.get_addr_from_offset(get_sw_window_offset(dai_addr));
+        tl_access(.addr(tlul_addr), .write(0), .data(tlul_val), .blocking(1), .check_rsp(0));
+      end
+
+      if (i == num_to_lock_digests) cal_hw_digests('1);
+
+      csr_rd(ral.status, tlul_val);
+    end
+
+    do_otp_ctrl_init = 0;
+    do_otp_pwr_init  = 0;
+    cfg.en_scb       = 0;
+    dut_init();
+
+    if (init_chk_err) begin
+      `uvm_info(`gfn, $sformatf("OTP_init check failure with init error = %0h", init_chk_err),
+                UVM_LOW)
+      foreach(init_chk_err[i]) begin
+        if (init_chk_err[i]) exp_status |= 1'b1 << i;
+      end
+
+      check_otp_fatal_err("fatal_check_error", exp_status);
+
+    // If not check error, force ECC correctable and uncorrectable error
+    end else begin
+      otp_ecc_err_e   ecc_err;
+      bit             is_fatal;
+      bit [TL_DW-1:0] addr;
+
+      for (int i = 0; i < NumPart-1; i++) begin
+        `DV_CHECK_RANDOMIZE_FATAL(this);
+
+        if (i inside {CreatorSwCfgIdx, OwnerSwCfgIdx}) begin
+          // During OTP init, SW partition only reads digest value
+          addr = PART_OTP_DIGEST_ADDRS[i] << 2;
+        end else begin
+          // During OTP init, non SW partition only read all value
+          addr = $urandom_range(PartInfo[i].offset, PartInfo[i].offset + PartInfo[i].size - 1);
+        end
+
+        backdoor_inject_ecc_err(addr, ecc_err_mask, ecc_err);
+        if (ecc_err == OtpEccUncorrErr && !is_fatal) is_fatal = 1;
+        if (ecc_err != OtpNoEccErr) exp_status[i] = 1;
+      end
+
+      if (is_fatal) begin
+        // ECC uncorrectable error.
+        `uvm_info(`gfn, "OTP_init macro ECC uncorrectable failure", UVM_LOW)
+        check_otp_fatal_err("fatal_macro_error", exp_status);
+      end else if ($urandom_range(0, 1)) begin
+
+        // Randomly force ECC reg in sw partitions to create a check failure
+        bit [1:0] sw_check_fail = $urandom_range(1, 3);
+        cfg.otp_ctrl_vif.force_sw_check_fail(sw_check_fail);
+        `uvm_info(`gfn, $sformatf("OTP_init SW ECC check failure with index %0h", sw_check_fail),
+                  UVM_LOW)
+        foreach(sw_check_fail[i]) begin
+          if (sw_check_fail[i]) exp_status[i] = 1;
+        end
+        check_otp_fatal_err("fatal_check_error", exp_status);
+      end else begin
+
+        // Expect the OTP init to continue with an ECC correctable interrupt.
+        `uvm_info(`gfn, "OTP_init macro ECC correctable failure", UVM_LOW)
+        exp_status[OtpDaiIdleIdx] = 1;
+        cfg.otp_ctrl_vif.drive_pwr_otp_init(1);
+        wait(cfg.otp_ctrl_vif.pwr_otp_done_o == 1);
+        wait(cfg.otp_ctrl_vif.pwr_otp_idle_o == 1);
+        csr_rd_check(.ptr(ral.status), .compare_value(exp_status));
+        csr_rd_check(.ptr(ral.intr_state.otp_error), .compare_value(1));
+
+        // Create LC check failure.
+        cfg.otp_ctrl_vif.lc_check_byp_en = 0;
+        req_lc_transition(1);
+        trigger_checks(.val('1), .wait_done(0));
+        exp_status[OtpLifeCycleErrIdx] = 1;
+        check_otp_fatal_err("fatal_check_error", exp_status, 0);
+      end
+    end
+  endtask
+
+  virtual task check_otp_fatal_err(string alert_name, bit [TL_DW-1:0] exp_status, bit is_init = 1);
+    cfg.otp_ctrl_vif.drive_pwr_otp_init(1);
+
+    // Wait until OTP_INIT process the error
+    `DV_SPINWAIT_EXIT(wait(cfg.m_alert_agent_cfg[alert_name].vif.alert_tx_final.alert_p);,
+                      cfg.clk_rst_vif.wait_clks(5000);,
+                      $sformatf("Timeout waiting for alert %0s", alert_name))
+    check_fatal_alert_nonblocking(alert_name);
+
+    cfg.otp_ctrl_vif.drive_pwr_otp_init(0);
+
+    // Wait until all partitions finish initialization
+    cfg.clk_rst_vif.wait_clks($urandom_range(2000, 4000));
+
+    csr_rd_check(.ptr(ral.status), .compare_value(exp_status));
+
+    if (is_init) begin
+      `DV_CHECK_EQ(cfg.otp_ctrl_vif.pwr_otp_done_o, 0)
+      `DV_CHECK_EQ(cfg.otp_ctrl_vif.pwr_otp_idle_o, 0)
+    end
+
+    // Issue reset to stop fatal alert
+    apply_reset();
+
+    // delay to avoid race condition when sending item and checking no item after reset occur
+    // at the same time
+    #1ps;
+  endtask
+
+endclass
